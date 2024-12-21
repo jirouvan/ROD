@@ -52,6 +52,7 @@ class YOLOv10HeadModule(BaseModule):
 
     def __init__(self,
                  num_classes: int,
+                 num_state: int,
                  in_channels: Union[int, Sequence],
                  widen_factor: float = 1.0,
                  num_base_priors: int = 1,
@@ -63,6 +64,7 @@ class YOLOv10HeadModule(BaseModule):
                  init_cfg: OptMultiConfig = None):
         super().__init__(init_cfg=init_cfg)
         self.num_classes = num_classes
+        self.num_state = num_state
         self.featmap_strides = featmap_strides
         self.num_levels = len(self.featmap_strides)
         self.num_base_priors = num_base_priors
@@ -83,27 +85,35 @@ class YOLOv10HeadModule(BaseModule):
     def init_weights(self, prior_prob=0.01):
         """Initialize the weight and bias of PPYOLOE head."""
         super().init_weights()
-        for one2many_reg_pred, one2many_cls_pred, one2one_reg_pred, one2one_cls_pred, stride in zip(
+        for one2many_reg_pred, one2many_cls_pred, one2many_state_pred, \
+            one2one_reg_pred, one2one_cls_pred, one2one_state_pred, stride in zip(
                 self.one2many_reg_preds,
                 self.one2many_cls_preds,
+                self.one2many_state_preds,
                 self.one2one_reg_preds,
                 self.one2one_cls_preds,
+                self.one2one_state_preds,
                 self.featmap_strides):
             one2many_reg_pred[-1].bias.data[:] = 1.0  # box
             one2one_reg_pred[-1].bias.data[:] = 1.0  # box
 
-            # cls (.01 objects, 80 classes, 640 img)
+            # cls (.01 objects, 10 classes, 640 img)
             one2many_cls_pred[-1].bias.data[:self.num_classes] = math.log(5 / self.num_classes / (640 / stride) ** 2)
             one2one_cls_pred[-1].bias.data[:self.num_classes] = math.log(5 / self.num_classes / (640 / stride) ** 2)
+            # state (.01 objects, 2 classes, 640 img)
+            one2many_state_pred[-1].bias.data[:self.num_state] = math.log(5 / self.num_state / (640 / stride) ** 2)
+            one2one_state_pred[-1].bias.data[:self.num_state] = math.log(5 / self.num_state / (640 / stride) ** 2)
 
     def one2many_init_layers(self):
         """initialize conv layers in YOLOv8 head."""
         # Init decouple head
         self.one2many_cls_preds = nn.ModuleList()
+        self.one2many_state_preds = nn.ModuleList()
         self.one2many_reg_preds = nn.ModuleList()
 
         reg_out_channels = max((16, self.in_channels[0] // 4, self.reg_max * 4))
         cls_out_channels = max(self.in_channels[0], self.num_classes)
+        state_out_channels = max(self.in_channels[0], self.num_state)
 
         for i in range(self.num_levels):
             self.one2many_reg_preds.append(
@@ -150,6 +160,28 @@ class YOLOv10HeadModule(BaseModule):
                         in_channels=cls_out_channels,
                         out_channels=self.num_classes,
                         kernel_size=1)))
+            self.one2many_state_preds.append(
+                nn.Sequential(
+                    ConvModule(
+                        in_channels=self.in_channels[i],
+                        out_channels=state_out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg),
+                    ConvModule(
+                        in_channels=state_out_channels,
+                        out_channels=state_out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg),
+                    nn.Conv2d(
+                        in_channels=state_out_channels,
+                        out_channels=self.num_state,
+                        kernel_size=1)))
 
         proj = torch.arange(self.reg_max, dtype=torch.float)
         self.register_buffer('one2many_proj', proj, persistent=False)
@@ -158,10 +190,14 @@ class YOLOv10HeadModule(BaseModule):
         """initialize conv layers in YOLOv8 head."""
         # Init decouple head
         self.one2one_cls_preds = nn.ModuleList()
+        self.one2one_state_preds = nn.ModuleList()
         self.one2one_reg_preds = nn.ModuleList()
 
         reg_out_channels = max((16, self.in_channels[0] // 4, self.reg_max * 4))
         cls_out_channels = max(self.in_channels[0], self.num_classes)
+        state_out_channels = max(self.in_channels[0], self.num_state)
+        # this way dont use cls_out_channels to be out_channels
+        # it use self.in_channels[i] to be out_channels
         c3 = max(self.in_channels[0], min(self.num_classes, 100))
         for i in range(self.num_levels):
             self.one2one_reg_preds.append(
@@ -223,6 +259,44 @@ class YOLOv10HeadModule(BaseModule):
                 )
             )
 
+            self.one2one_state_preds.append(
+                nn.Sequential(
+                    ConvModule(in_channels=self.in_channels[i],
+                               out_channels=self.in_channels[i],
+                               kernel_size=3,
+                               stride=1,
+                               groups=self.in_channels[i],
+                               padding=1,
+                               norm_cfg=self.norm_cfg,
+                               act_cfg=self.act_cfg),
+                    ConvModule(in_channels=self.in_channels[i],
+                               out_channels=c3,
+                               kernel_size=1,
+                               stride=1,
+                               padding=0,
+                               norm_cfg=self.norm_cfg,
+                               act_cfg=self.act_cfg),
+                    ConvModule(in_channels=c3,
+                               out_channels=c3,
+                               kernel_size=3,
+                               groups=c3,
+                               stride=1,
+                               padding=1,
+                               norm_cfg=self.norm_cfg,
+                               act_cfg=self.act_cfg),
+                    ConvModule(in_channels=c3,
+                               out_channels=c3,
+                               kernel_size=1,
+                               stride=1,
+                               padding=0,
+                               norm_cfg=self.norm_cfg,
+                               act_cfg=self.act_cfg),
+                    nn.Conv2d(in_channels=c3,
+                              out_channels=self.num_state,
+                              kernel_size=1)
+                )
+            )
+
         proj = torch.arange(self.reg_max, dtype=torch.float)
         self.register_buffer('one2one_proj', proj, persistent=False)
 
@@ -238,7 +312,9 @@ class YOLOv10HeadModule(BaseModule):
         """
         assert len(x) == self.num_levels
 
-        return multi_apply(self.one2many_forward_single, x, self.one2many_cls_preds, self.one2many_reg_preds)
+        return multi_apply(self.one2many_forward_single, x,
+                           self.one2many_cls_preds, self.one2many_state_preds,
+                           self.one2many_reg_preds)
 
     def forward_one2one(self, x: Tuple[Tensor]) -> Tuple[List]:
         """Forward features from the upstream network.
@@ -251,13 +327,17 @@ class YOLOv10HeadModule(BaseModule):
             predictions
         """
         assert len(x) == self.num_levels
-        return multi_apply(self.one2one_forward_single, x, self.one2one_cls_preds, self.one2one_reg_preds)
+        return multi_apply(self.one2one_forward_single, x,
+                           self.one2one_cls_preds, self.one2one_state_preds,
+                           self.one2one_reg_preds)
 
     def one2many_forward_single(self, x: torch.Tensor, cls_pred: nn.ModuleList,
+                                state_pred: nn.ModuleList,
                                 reg_pred: nn.ModuleList) -> Tuple:
         """Forward feature of a single scale level."""
         b, _, h, w = x.shape
         cls_logit = cls_pred(x)
+        state_logit = state_pred(x)
         bbox_dist_preds = reg_pred(x)
         if self.reg_max > 1:
             bbox_dist_preds = bbox_dist_preds.reshape([-1, 4, self.reg_max, h * w]).permute(0, 3, 1, 2)
@@ -270,15 +350,17 @@ class YOLOv10HeadModule(BaseModule):
         else:
             bbox_preds = bbox_dist_preds
         if self.training:
-            return cls_logit, bbox_preds, bbox_dist_preds
+            return cls_logit, state_logit, bbox_preds, bbox_dist_preds
         else:
-            return cls_logit, bbox_preds
+            return cls_logit, state_logit, bbox_preds
 
     def one2one_forward_single(self, x: torch.Tensor, cls_pred: nn.ModuleList,
+                               state_pred: nn.ModuleList,
                                reg_pred: nn.ModuleList) -> Tuple:
         """Forward feature of a single scale level."""
         b, _, h, w = x.shape
         cls_logit = cls_pred(x)
+        state_logit = state_pred(x)
         bbox_dist_preds = reg_pred(x)
 
         if self.reg_max > 1:
@@ -293,32 +375,13 @@ class YOLOv10HeadModule(BaseModule):
             bbox_preds = bbox_dist_preds
 
         if self.training:
-            return cls_logit, bbox_preds, bbox_dist_preds
+            return cls_logit, state_logit, bbox_preds, bbox_dist_preds
         else:
-            return cls_logit, bbox_preds
+            return cls_logit, state_logit, bbox_preds
 
 
 @MODELS.register_module()
 class YOLOv10Head(BaseDenseHead):
-    """YOLOv10Head head used in `YOLOv10`.
-
-    Args:
-        head_module(:obj:`ConfigDict` or dict): Base module used for YOLOv8Head
-        prior_generator(dict): Points generator feature maps
-            in 2D points-based detectors.
-        bbox_coder (:obj:`ConfigDict` or dict): Config of bbox coder.
-        loss_cls (:obj:`ConfigDict` or dict): Config of classification loss.
-        loss_bbox (:obj:`ConfigDict` or dict): Config of localization loss.
-        loss_dfl (:obj:`ConfigDict` or dict): Config of Distribution Focal
-            Loss.
-        train_cfg (:obj:`ConfigDict` or dict, optional): Training config of
-            anchor head. Defaults to None.
-        test_cfg (:obj:`ConfigDict` or dict, optional): Testing config of
-            anchor head. Defaults to None.
-        init_cfg (:obj:`ConfigDict` or list[:obj:`ConfigDict`] or dict or
-            list[dict], optional): Initialization config dict.
-            Defaults to None.
-    """
 
     def __init__(self,
                  head_module: ConfigType,
@@ -328,6 +391,11 @@ class YOLOv10Head(BaseDenseHead):
                      strides=[8, 16, 32]),
                  bbox_coder: ConfigType = dict(type='DistancePointBBoxCoder'),
                  loss_cls: ConfigType = dict(
+                     type='mmdet.CrossEntropyLoss',
+                     use_sigmoid=True,
+                     reduction='none',
+                     loss_weight=0.5),
+                 loss_state: ConfigType = dict(
                      type='mmdet.CrossEntropyLoss',
                      use_sigmoid=True,
                      reduction='none',
@@ -348,13 +416,15 @@ class YOLOv10Head(BaseDenseHead):
                  test_cfg: OptConfigType = None,
                  init_cfg: OptMultiConfig = None):
         super().__init__(init_cfg=init_cfg)
-
+###############################################################################################################################
         self.head_module = MODELS.build(head_module)
         self.num_classes = self.head_module.num_classes
+        self.num_state = self.head_module.num_state
         self.featmap_strides = self.head_module.featmap_strides
         self.num_levels = len(self.featmap_strides)
 
         self.loss_cls: nn.Module = MODELS.build(loss_cls)
+        self.loss_state: nn.Module = MODELS.build(loss_state)
         self.loss_bbox: nn.Module = MODELS.build(loss_bbox)
 
         self.prior_generator = TASK_UTILS.build(prior_generator)
@@ -397,7 +467,7 @@ class YOLOv10Head(BaseDenseHead):
             self.num_level_priors = None
             self.flatten_priors_train = None
             self.stride_tensor = None
-
+####################################forward loss loss_by_feat#############################3$$$$$$$$$$$$$$$$$##################
     def forward(self, x: Tuple[Tensor]) -> Tuple[List]:
         """Forward features from the upstream network.
 
@@ -416,7 +486,7 @@ class YOLOv10Head(BaseDenseHead):
         return one2many_result, one2one_result
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: Union[list,
-    dict]) -> dict:
+                                                               dict]) -> dict:
         """Perform forward propagation and loss calculation of the detection
         head on the features of the upstream network.
 
@@ -460,6 +530,7 @@ class YOLOv10Head(BaseDenseHead):
     def one2many_loss_by_feat(
             self,
             cls_scores: Sequence[Tensor],
+            state_scores: Sequence[Tensor],
             bbox_preds: Sequence[Tensor],
             bbox_dist_preds: Sequence[Tensor],
             batch_gt_instances: Sequence[InstanceData],
@@ -514,11 +585,41 @@ class YOLOv10Head(BaseDenseHead):
         gt_bboxes = gt_info[:, :, 1:]  # xyxy
         pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls_label = torch.tensor([], device=device)
+        state_label = torch.tensor([], device=device)
+        cls_label_temp = []
+        state_label_temp = []
+        for label in gt_labels:
+            cls_list = torch.tensor([], device=device)
+            cls_list = cls_list.view(1, -1, 1)
+            state_list = torch.tensor([], device=device)
+            state_list = state_list.view(1, -1, 1)
+            for l in label:
+                temp = l % 10  # 取余，得到个位
+                temp = temp.view(1, -1, 1)
+                cls_list = torch.cat((cls_list, temp), dim=1)
+                temp = torch.floor_divide(l, 10)  # 整除，取十位
+                temp = temp.view(1, -1, 1)
+                state_list = torch.cat((state_list, temp), dim=1)
+            cls_label_temp.append(cls_list)
+            state_label_temp.append(state_list)
+
+        cls_label = torch.concat(cls_label_temp)
+        state_label = torch.concat(state_label_temp)
+
         # pred info
         flatten_cls_preds = [
             cls_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, self.num_classes)
             for cls_pred in cls_scores
         ]
+
+        flatten_state_preds = [
+            state_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                   self.num_state)
+            for state_pred in state_scores
+        ]
+
         flatten_pred_bboxes = [
             bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
             for bbox_pred in bbox_preds
@@ -529,24 +630,36 @@ class YOLOv10Head(BaseDenseHead):
 
         flatten_dist_preds = torch.cat(flatten_pred_dists, dim=1)
         flatten_cls_preds = torch.cat(flatten_cls_preds, dim=1)
+        flatten_state_preds = torch.cat(flatten_state_preds, dim=1)
         flatten_pred_bboxes = torch.cat(flatten_pred_bboxes, dim=1)
         flatten_pred_bboxes = self.bbox_coder.decode(
             self.flatten_priors_train[..., :2], flatten_pred_bboxes,
             self.stride_tensor[..., 0])
 
-        assigned_result = self.one2many_assigner(
+##########################################one2many_assigner###########################
+        cls_assigned_result = self.one2many_assigner(
             (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
             flatten_cls_preds.detach().sigmoid(), self.flatten_priors_train,
-            gt_labels, gt_bboxes, pad_bbox_flag)
+            cls_label, gt_bboxes, pad_bbox_flag, self.num_classes)
 
-        assigned_bboxes = assigned_result['assigned_bboxes']
-        assigned_scores = assigned_result['assigned_scores']
-        fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
+        assigned_bboxes = cls_assigned_result['assigned_bboxes']
+        cls_assigned_scores = cls_assigned_result['assigned_scores']
+        fg_mask_pre_prior = cls_assigned_result['fg_mask_pre_prior']
 
-        assigned_scores_sum = assigned_scores.sum().clamp(min=1)
+        state_assigned_result = self.one2many_assigner(
+            (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
+            flatten_state_preds.detach().sigmoid(), self.flatten_priors_train,
+            state_label, gt_bboxes, pad_bbox_flag, self.num_state)
+        state_assigned_scores = state_assigned_result['assigned_scores']
 
-        loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores).sum()
-        loss_cls /= assigned_scores_sum
+        cls_assigned_scores_sum = cls_assigned_scores.sum().clamp(min=1)
+        state_assigned_scores_sum = state_assigned_scores.sum().clamp(min=1)
+
+        loss_cls = self.loss_cls(flatten_cls_preds, cls_assigned_scores).sum()
+        loss_cls /= cls_assigned_scores_sum
+
+        loss_state = self.loss_state(flatten_state_preds, state_assigned_scores).sum()
+        loss_state /= state_assigned_scores_sum
 
         # rescale bbox
         assigned_bboxes /= self.stride_tensor
@@ -564,10 +677,10 @@ class YOLOv10Head(BaseDenseHead):
             assigned_bboxes_pos = torch.masked_select(
                 assigned_bboxes, prior_bbox_mask).reshape([-1, 4])
             bbox_weight = torch.masked_select(
-                assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
+                cls_assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
             loss_bbox = self.loss_bbox(
                 pred_bboxes_pos, assigned_bboxes_pos,
-                weight=bbox_weight) / assigned_scores_sum
+                weight=bbox_weight) / cls_assigned_scores_sum
 
             # dfl loss
             pred_dist_pos = flatten_dist_preds[fg_mask_pre_prior]
@@ -582,7 +695,7 @@ class YOLOv10Head(BaseDenseHead):
                 pred_dist_pos.reshape(-1, self.head_module.reg_max),
                 assigned_ltrb_pos.reshape(-1),
                 weight=bbox_weight.expand(-1, 4).reshape(-1),
-                avg_factor=assigned_scores_sum)
+                avg_factor=cls_assigned_scores_sum)
         else:
             loss_bbox = flatten_pred_bboxes.sum() * 0
             loss_dfl = flatten_pred_bboxes.sum() * 0
@@ -590,12 +703,14 @@ class YOLOv10Head(BaseDenseHead):
 
         return dict(
             one2many_loss_cls=loss_cls * num_imgs * world_size,
+            one2many_loss_state=loss_state * num_imgs * world_size,
             one2many_loss_bbox=loss_bbox * num_imgs * world_size,
             one2many_loss_dfl=loss_dfl * num_imgs * world_size)
 
     def one2one_loss_by_feat(
             self,
             cls_scores: Sequence[Tensor],
+            state_scores: Sequence[Tensor],
             bbox_preds: Sequence[Tensor],
             bbox_dist_preds: Sequence[Tensor],
             batch_gt_instances: Sequence[InstanceData],
@@ -651,12 +766,42 @@ class YOLOv10Head(BaseDenseHead):
         gt_bboxes = gt_info[:, :, 1:]  # xyxy
         pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls_label = torch.tensor([], device=device)
+        state_label = torch.tensor([], device=device)
+        cls_label_temp = []
+        state_label_temp = []
+        for label in gt_labels:
+            cls_list = torch.tensor([], device=device)
+            cls_list = cls_list.view(1, -1, 1)
+            state_list = torch.tensor([], device=device)
+            state_list = state_list.view(1, -1, 1)
+            for l in label:
+                temp = l % 10  # 取余，得到个位
+                temp = temp.view(1, -1, 1)
+                cls_list = torch.cat((cls_list, temp), dim=1)
+                temp = torch.floor_divide(l, 10)  # 整除，取十位
+                temp = temp.view(1, -1, 1)
+                state_list = torch.cat((state_list, temp), dim=1)
+            cls_label_temp.append(cls_list)
+            state_label_temp.append(state_list)
+
+        cls_label = torch.concat(cls_label_temp)
+        state_label = torch.concat(state_label_temp)
+
         # pred info
         flatten_cls_preds = [
             cls_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
                                                  self.num_classes)
             for cls_pred in cls_scores
         ]
+
+        flatten_state_preds = [
+            state_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                   self.num_state)
+            for state_pred in state_scores
+        ]
+
         flatten_pred_bboxes = [
             bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
             for bbox_pred in bbox_preds
@@ -667,24 +812,35 @@ class YOLOv10Head(BaseDenseHead):
 
         flatten_dist_preds = torch.cat(flatten_pred_dists, dim=1)
         flatten_cls_preds = torch.cat(flatten_cls_preds, dim=1)
+        flatten_state_preds = torch.cat(flatten_state_preds, dim=1)
         flatten_pred_bboxes = torch.cat(flatten_pred_bboxes, dim=1)
         flatten_pred_bboxes = self.bbox_coder.decode(
             self.flatten_priors_train[..., :2], flatten_pred_bboxes,
             self.stride_tensor[..., 0])
 
-        assigned_result = self.one2one_assigner(
+        cls_assigned_result = self.one2one_assigner(
             (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
             flatten_cls_preds.detach().sigmoid(), self.flatten_priors_train,
-            gt_labels, gt_bboxes, pad_bbox_flag)
+            cls_label, gt_bboxes, pad_bbox_flag, self.num_classes)
 
-        assigned_bboxes = assigned_result['assigned_bboxes']
-        assigned_scores = assigned_result['assigned_scores']
-        fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
+        assigned_bboxes = cls_assigned_result['assigned_bboxes']
+        cls_assigned_scores = cls_assigned_result['assigned_scores']
+        fg_mask_pre_prior = cls_assigned_result['fg_mask_pre_prior']
 
-        assigned_scores_sum = assigned_scores.sum().clamp(min=1)
+        state_assigned_result = self.one2one_assigner(
+            (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
+            flatten_state_preds.detach().sigmoid(), self.flatten_priors_train,
+            state_label, gt_bboxes, pad_bbox_flag, self.num_state)
+        state_assigned_scores = state_assigned_result['assigned_scores']
 
-        loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores).sum()
-        loss_cls /= assigned_scores_sum
+        cls_assigned_scores_sum = cls_assigned_scores.sum().clamp(min=1)
+        state_assigned_scores_sum = state_assigned_scores.sum().clamp(min=1)
+
+        loss_cls = self.loss_cls(flatten_cls_preds, cls_assigned_scores).sum()
+        loss_cls /= cls_assigned_scores_sum
+
+        loss_state = self.loss_state(flatten_state_preds, state_assigned_scores).sum()
+        loss_state /= state_assigned_scores_sum
 
         # rescale bbox
         assigned_bboxes /= self.stride_tensor
@@ -702,10 +858,10 @@ class YOLOv10Head(BaseDenseHead):
             assigned_bboxes_pos = torch.masked_select(
                 assigned_bboxes, prior_bbox_mask).reshape([-1, 4])
             bbox_weight = torch.masked_select(
-                assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
+                cls_assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
             loss_bbox = self.loss_bbox(
                 pred_bboxes_pos, assigned_bboxes_pos,
-                weight=bbox_weight) / assigned_scores_sum
+                weight=bbox_weight) / cls_assigned_scores_sum
 
             # dfl loss
             pred_dist_pos = flatten_dist_preds[fg_mask_pre_prior]
@@ -720,7 +876,7 @@ class YOLOv10Head(BaseDenseHead):
                 pred_dist_pos.reshape(-1, self.head_module.reg_max),
                 assigned_ltrb_pos.reshape(-1),
                 weight=bbox_weight.expand(-1, 4).reshape(-1),
-                avg_factor=assigned_scores_sum)
+                avg_factor=cls_assigned_scores_sum)
         else:
             loss_bbox = flatten_pred_bboxes.sum() * 0
             loss_dfl = flatten_pred_bboxes.sum() * 0
@@ -728,9 +884,10 @@ class YOLOv10Head(BaseDenseHead):
 
         return dict(
             one2one_loss_cls=loss_cls * num_imgs * world_size,
+            one2one_loss_state=loss_state * num_imgs * world_size,
             one2one_loss_bbox=loss_bbox * num_imgs * world_size,
             one2one_loss_dfl=loss_dfl * num_imgs * world_size)
-
+#####################################predict do not change#####################3
     def predict(self,
                 x: Tuple[Tensor],
                 batch_data_samples: SampleList,
@@ -776,6 +933,7 @@ class YOLOv10Head(BaseDenseHead):
 
     def predict_by_feat(self,
                         cls_scores: List[Tensor],
+                        state_scores: List[Tensor],
                         bbox_preds: List[Tensor],
                         objectnesses: Optional[List[Tensor]] = None,
                         batch_img_metas: Optional[List[dict]] = None,
@@ -839,15 +997,26 @@ class YOLOv10Head(BaseDenseHead):
                 featmap_sizes,
                 dtype=cls_scores[0].dtype,
                 device=cls_scores[0].device)
+            self.mlvl_priors_state = self.prior_generator.grid_priors(
+                featmap_sizes,
+                dtype=state_scores[0].dtype,
+                device=state_scores[0].device)
             self.featmap_sizes = featmap_sizes
         flatten_priors = torch.cat(self.mlvl_priors)
+        flatten_priors_state = torch.cat(self.mlvl_priors_state)
 
         mlvl_strides = [
             flatten_priors.new_full(
                 (featmap_size.numel() * self.num_base_priors,), stride) for
             featmap_size, stride in zip(featmap_sizes, self.featmap_strides)
         ]
+        mlvl_strides_state = [
+            flatten_priors_state.new_full(
+                (featmap_size.numel() * self.num_base_priors,), stride) for
+            featmap_size, stride in zip(featmap_sizes, self.featmap_strides)
+        ]
         flatten_stride = torch.cat(mlvl_strides)
+        flatten_stride_state = torch.cat(mlvl_strides_state)
 
         # flatten cls_scores, bbox_preds and objectness
         flatten_cls_scores = [
@@ -855,12 +1024,18 @@ class YOLOv10Head(BaseDenseHead):
                                                   self.num_classes)
             for cls_score in cls_scores
         ]
+        flatten_state_scores = [
+            state_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                    self.num_state)
+            for state_score in state_scores
+        ]
         flatten_bbox_preds = [
             bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
             for bbox_pred in bbox_preds
         ]
 
         flatten_cls_scores = torch.cat(flatten_cls_scores, dim=1).sigmoid()
+        flatten_state_scores = torch.cat(flatten_state_scores, dim=1).sigmoid()
         flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
         flatten_decoded_bboxes = self.bbox_coder.decode(
             flatten_priors[None], flatten_bbox_preds, flatten_stride)
@@ -874,9 +1049,10 @@ class YOLOv10Head(BaseDenseHead):
         else:
             flatten_objectness = [None for _ in range(num_imgs)]
 
-        results_list = []
-        for (bboxes, scores, objectness,
-             img_meta) in zip(flatten_decoded_bboxes, flatten_cls_scores,
+        results_list_cls = []
+        results_list_state = []
+        for (bboxes, scores_cls, scores_state, objectness,
+             img_meta) in zip(flatten_decoded_bboxes, flatten_cls_scores, flatten_state_scores,
                               flatten_objectness, batch_img_metas):
             ori_shape = img_meta['ori_shape']
             scale_factor = img_meta['scale_factor']
@@ -891,61 +1067,87 @@ class YOLOv10Head(BaseDenseHead):
                     'yolox_style', False):
                 conf_inds = objectness > score_thr
                 bboxes = bboxes[conf_inds, :]
-                scores = scores[conf_inds, :]
+                scores_cls = scores_cls[conf_inds, :]
+                scores_state = scores_state[conf_inds, :]
                 objectness = objectness[conf_inds]
 
             if objectness is not None:
                 # conf = obj_conf * cls_conf
-                scores *= objectness[:, None]
+                scores_cls *= objectness[:, None]
+                scores_state *= objectness[:, None]
 
-            if scores.shape[0] == 0:
+            if scores_cls.shape[0] == 0 or scores_state.shape[0] == 0:
                 empty_results = InstanceData()
                 empty_results.bboxes = bboxes
-                empty_results.scores = scores[:, 0]
-                empty_results.labels = scores[:, 0].int()
-                results_list.append(empty_results)
+                empty_results.scores_cls = scores_cls[:, 0]
+                empty_results.labels = scores_cls[:, 0].int()
+                results_list_cls.append(empty_results)
+
+                empty_results = InstanceData()
+                empty_results.bboxes = bboxes
+                empty_results.scores_state = scores_state[:, 0]
+                empty_results.labels = scores_state[:, 0].int()
+                results_list_state.append(empty_results)
                 continue
 
             nms_pre = cfg.get('nms_pre', 100000)
             if cfg.multi_label is False:
-                scores, labels = scores.max(1, keepdim=True)
-                scores, _, keep_idxs, results = filter_scores_and_topk(
-                    scores,
+                scores_cls, labels = scores_cls.max(1, keepdim=True)
+                scores_cls, _, keep_idxs_cls, results_cls = filter_scores_and_topk(
+                    scores_cls,
                     score_thr,
                     nms_pre,
                     results=dict(labels=labels[:, 0]))
-                labels = results['labels']
+                labels = results_cls['labels']
             else:
-                scores, labels, keep_idxs, _ = filter_scores_and_topk(
-                    scores, score_thr, nms_pre)
+                scores_cls, labels_cls, keep_idxs_cls, _ = filter_scores_and_topk(
+                    scores_cls, score_thr, nms_pre)
+                scores_state, labels_state, keep_idxs_state, _ = filter_scores_and_topk(
+                    scores_state, score_thr, nms_pre)
 
-            results = InstanceData(
-                scores=scores, labels=labels, bboxes=bboxes[keep_idxs])
+            results_cls = InstanceData(
+                scores=scores_cls, labels=labels_cls, bboxes=bboxes[keep_idxs_cls])
+            results_state = InstanceData(
+                scores=scores_state, labels=labels_state, bboxes=bboxes[keep_idxs_state])
 
             if rescale:
                 if pad_param is not None:
-                    results.bboxes -= results.bboxes.new_tensor([
+                    results_cls.bboxes -= results_cls.bboxes.new_tensor([
                         pad_param[2], pad_param[0], pad_param[2], pad_param[0]
                     ])
-                results.bboxes /= results.bboxes.new_tensor(
+                    results_state.bboxes -= results_state.bboxes.new_tensor([
+                        pad_param[2], pad_param[0], pad_param[2], pad_param[0]
+                    ])
+                results_cls.bboxes /= results_cls.bboxes.new_tensor(
+                    scale_factor).repeat((1, 2))
+                results_state.bboxes /= results_state.bboxes.new_tensor(
                     scale_factor).repeat((1, 2))
 
             if cfg.get('yolox_style', False):
                 # do not need max_per_img
                 cfg.max_per_img = len(results)
 
-            results = self._bbox_post_process(
-                results=results,
+            results_cls = self._bbox_post_process(
+                results=results_cls,
                 cfg=cfg,
                 rescale=False,
                 with_nms=with_nms,
                 img_meta=img_meta)
-            results.bboxes[:, 0::2].clamp_(0, ori_shape[1])
-            results.bboxes[:, 1::2].clamp_(0, ori_shape[0])
+            results_state = self._bbox_post_process(
+                results=results_state,
+                cfg=cfg,
+                rescale=False,
+                with_nms=with_nms,
+                img_meta=img_meta)
+            results_cls.bboxes[:, 0::2].clamp_(0, ori_shape[1])
+            results_cls.bboxes[:, 1::2].clamp_(0, ori_shape[0])
+            results_state.bboxes[:, 0::2].clamp_(0, ori_shape[1])
+            results_state.bboxes[:, 1::2].clamp_(0, ori_shape[0])
 
-            results_list.append(results)
-        return results_list
-
+            results_list_cls.append(results_cls)
+            results_list_state.append(results_state)
+        return results_list_cls, results_list_state
+################################do not change########################
     def _convert_gt_to_norm_format(self,
                                    batch_gt_instances: Sequence[InstanceData],
                                    batch_img_metas: Sequence[dict]) -> Tensor:

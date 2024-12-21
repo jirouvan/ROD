@@ -54,6 +54,7 @@ class YOLOv5HeadModule(BaseModule):
 
     def __init__(self,
                  num_classes: int,
+                 num_state: int,
                  in_channels: Union[int, Sequence],
                  widen_factor: float = 1.0,
                  num_base_priors: int = 3,
@@ -61,6 +62,7 @@ class YOLOv5HeadModule(BaseModule):
                  init_cfg: OptMultiConfig = None):
         super().__init__(init_cfg=init_cfg)
         self.num_classes = num_classes
+        self.num_state = num_state
         self.widen_factor = widen_factor
 
         self.featmap_strides = featmap_strides
@@ -171,6 +173,11 @@ class YOLOv5Head(BaseDenseHead):
                      use_sigmoid=True,
                      reduction='mean',
                      loss_weight=0.5),
+                 loss_state: ConfigType = dict(
+                     type='mmdet.CrossEntropyLoss',
+                     use_sigmoid=True,
+                     reduction='mean',
+                     loss_weight=0.5),
                  loss_bbox: ConfigType = dict(
                      type='IoULoss',
                      iou_mode='ciou',
@@ -195,6 +202,7 @@ class YOLOv5Head(BaseDenseHead):
 
         self.head_module = MODELS.build(head_module)
         self.num_classes = self.head_module.num_classes
+        self.num_state = self.head_module.num_state
         self.featmap_strides = self.head_module.featmap_strides
         self.num_levels = len(self.featmap_strides)
 
@@ -202,6 +210,7 @@ class YOLOv5Head(BaseDenseHead):
         self.test_cfg = test_cfg
 
         self.loss_cls: nn.Module = MODELS.build(loss_cls)
+        self.loss_state: nn.Module = MODELS.build(loss_state)
         self.loss_bbox: nn.Module = MODELS.build(loss_bbox)
         self.loss_obj: nn.Module = MODELS.build(loss_obj)
 
@@ -275,6 +284,7 @@ class YOLOv5Head(BaseDenseHead):
 
     def predict_by_feat(self,
                         cls_scores: List[Tensor],
+                        state_scores: List[Tensor],
                         bbox_preds: List[Tensor],
                         objectnesses: Optional[List[Tensor]] = None,
                         batch_img_metas: Optional[List[dict]] = None,
@@ -330,22 +340,33 @@ class YOLOv5Head(BaseDenseHead):
 
         num_imgs = len(batch_img_metas)
         featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]
-
+        # featmap_sizes = [state_score.shape[2:] for state_score in state_scores]
         # If the shape does not change, use the previous mlvl_priors
         if featmap_sizes != self.featmap_sizes:
             self.mlvl_priors = self.prior_generator.grid_priors(
                 featmap_sizes,
                 dtype=cls_scores[0].dtype,
                 device=cls_scores[0].device)
+            self.mlvl_priors_state = self.prior_generator.grid_priors(
+                featmap_sizes,
+                dtype=state_scores[0].dtype,
+                device=state_scores[0].device)
             self.featmap_sizes = featmap_sizes
         flatten_priors = torch.cat(self.mlvl_priors)
+        flatten_priors_state = torch.cat(self.mlvl_priors_state)
 
         mlvl_strides = [
             flatten_priors.new_full(
                 (featmap_size.numel() * self.num_base_priors, ), stride) for
             featmap_size, stride in zip(featmap_sizes, self.featmap_strides)
         ]
+        mlvl_strides_state = [
+            flatten_priors_state.new_full(
+                (featmap_size.numel() * self.num_base_priors,), stride) for
+            featmap_size, stride in zip(featmap_sizes, self.featmap_strides)
+        ]
         flatten_stride = torch.cat(mlvl_strides)
+        flatten_stride_state = torch.cat(mlvl_strides_state)
 
         # flatten cls_scores, bbox_preds and objectness
         flatten_cls_scores = [
@@ -353,12 +374,18 @@ class YOLOv5Head(BaseDenseHead):
                                                   self.num_classes)
             for cls_score in cls_scores
         ]
+        flatten_state_scores = [
+            state_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                  self.num_state)
+            for state_score in state_scores
+        ]
         flatten_bbox_preds = [
             bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
             for bbox_pred in bbox_preds
         ]
 
         flatten_cls_scores = torch.cat(flatten_cls_scores, dim=1).sigmoid()
+        flatten_state_scores = torch.cat(flatten_state_scores, dim=1).sigmoid()
         flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
         flatten_decoded_bboxes = self.bbox_coder.decode(
             flatten_priors[None], flatten_bbox_preds, flatten_stride)
@@ -372,9 +399,10 @@ class YOLOv5Head(BaseDenseHead):
         else:
             flatten_objectness = [None for _ in range(num_imgs)]
 
-        results_list = []
-        for (bboxes, scores, objectness,
-             img_meta) in zip(flatten_decoded_bboxes, flatten_cls_scores,
+        results_list_cls = []
+        results_list_state = []
+        for (bboxes, scores_cls, scores_state, objectness,
+             img_meta) in zip(flatten_decoded_bboxes, flatten_cls_scores,flatten_state_scores,
                               flatten_objectness, batch_img_metas):
             ori_shape = img_meta['ori_shape']
             scale_factor = img_meta['scale_factor']
@@ -389,60 +417,106 @@ class YOLOv5Head(BaseDenseHead):
                     'yolox_style', False):
                 conf_inds = objectness > score_thr
                 bboxes = bboxes[conf_inds, :]
-                scores = scores[conf_inds, :]
+                scores_cls = scores_cls[conf_inds, :]
+                scores_state = scores_state[conf_inds, :]
                 objectness = objectness[conf_inds]
 
             if objectness is not None:
                 # conf = obj_conf * cls_conf
-                scores *= objectness[:, None]
+                scores_cls *= objectness[:, None]
+                scores_state *= objectness[:, None]
 
-            if scores.shape[0] == 0:
+            if scores_cls.shape[0] == 0 or scores_state.shape[0] == 0 :
                 empty_results = InstanceData()
                 empty_results.bboxes = bboxes
-                empty_results.scores = scores[:, 0]
-                empty_results.labels = scores[:, 0].int()
-                results_list.append(empty_results)
+                empty_results.scores_cls = scores_cls[:, 0]
+                empty_results.labels = scores_cls[:, 0].int()
+                results_list_cls.append(empty_results)
+
+                empty_results = InstanceData()
+                empty_results.bboxes = bboxes
+                empty_results.scores_state = scores_state[:, 0]
+                empty_results.labels = scores_state[:, 0].int()
+                results_list_state.append(empty_results)
                 continue
 
             nms_pre = cfg.get('nms_pre', 100000)
             if cfg.multi_label is False:
-                scores, labels = scores.max(1, keepdim=True)
-                scores, _, keep_idxs, results = filter_scores_and_topk(
-                    scores,
+                scores_cls, labels = scores_cls.max(1, keepdim=True)
+                scores_cls, _, keep_idxs_cls, results_cls = filter_scores_and_topk(
+                    scores_cls,
                     score_thr,
                     nms_pre,
                     results=dict(labels=labels[:, 0]))
-                labels = results['labels']
+                labels = results_cls['labels']
             else:
-                scores, labels, keep_idxs, _ = filter_scores_and_topk(
-                    scores, score_thr, nms_pre)
+                scores_cls, labels_cls, keep_idxs_cls, _ = filter_scores_and_topk(
+                    scores_cls, score_thr, nms_pre)
+                # scores_state, labels_state, keep_idxs_state, _ = filter_scores_and_topk(
+                #     scores_state, score_thr, nms_pre)
 
-            results = InstanceData(
-                scores=scores, labels=labels, bboxes=bboxes[keep_idxs])
+            results_cls = InstanceData(
+                scores=scores_cls, labels=labels_cls, bboxes=bboxes[keep_idxs_cls])
+            # results_state = InstanceData(
+            #     scores=scores_state, labels=labels_state, bboxes=bboxes[keep_idxs_state])
+            results_state = InstanceData(
+                scores=scores_state[keep_idxs_cls].max(1)[0], labels=scores_state[keep_idxs_cls].max(1)[1],
+                bboxes=bboxes[keep_idxs_cls])
 
             if rescale:
                 if pad_param is not None:
-                    results.bboxes -= results.bboxes.new_tensor([
+                    results_cls.bboxes -= results_cls.bboxes.new_tensor([
                         pad_param[2], pad_param[0], pad_param[2], pad_param[0]
                     ])
-                results.bboxes /= results.bboxes.new_tensor(
+                    results_state.bboxes -= results_state.bboxes.new_tensor([
+                        pad_param[2], pad_param[0], pad_param[2], pad_param[0]
+                    ])
+                results_cls.bboxes /= results_cls.bboxes.new_tensor(
+                    scale_factor).repeat((1, 2))
+                results_state.bboxes /= results_state.bboxes.new_tensor(
                     scale_factor).repeat((1, 2))
 
             if cfg.get('yolox_style', False):
                 # do not need max_per_img
-                cfg.max_per_img = len(results)
+                cfg.max_per_img = len(results_cls)
 
-            results = self._bbox_post_process(
-                results=results,
+            results_cls = self._bbox_post_process(
+                results=results_cls,
                 cfg=cfg,
                 rescale=False,
                 with_nms=with_nms,
                 img_meta=img_meta)
-            results.bboxes[:, 0::2].clamp_(0, ori_shape[1])
-            results.bboxes[:, 1::2].clamp_(0, ori_shape[0])
+            # results_state = self._bbox_post_process(
+            #     results=results_state,
+            #     cfg=cfg,
+            #     rescale=False,
+            #     with_nms=with_nms,
+            #     img_meta=img_meta)
 
-            results_list.append(results)
-        return results_list
+            TensorA = results_cls.bboxes
+            TensorB = results_state.bboxes
+            flattened_A = TensorA.view(TensorA.shape[0], -1)
+            flattened_B = TensorB.view(TensorB.shape[0], -1)
+            expanded_A = flattened_A.unsqueeze(1).expand(-1, flattened_B.shape[0], -1)
+            matches = (expanded_A == flattened_B.unsqueeze(0))
+            matches_all = matches.all(dim=2)
+            found_indices = [torch.nonzero(matches_all[i]).squeeze().tolist() for i in range(matches_all.shape[0])]
+
+            for i in range(len(found_indices)):
+                if type(found_indices[i]) == list:
+                    found_indices[i] = found_indices[i][-1]
+
+            results_state = results_state[found_indices]
+
+
+            results_cls.bboxes[:, 0::2].clamp_(0, ori_shape[1])
+            results_cls.bboxes[:, 1::2].clamp_(0, ori_shape[0])
+            results_state.bboxes[:, 0::2].clamp_(0, ori_shape[1])
+            results_state.bboxes[:, 1::2].clamp_(0, ori_shape[0])
+
+            results_list_cls.append(results_cls)
+            results_list_state.append(results_state)
+        return results_list_cls, results_list_state
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: Union[list,
                                                                dict]) -> dict:

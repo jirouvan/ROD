@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Sequence, Tuple, Union
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,32 +21,10 @@ from .yolov6_head import YOLOv6Head
 
 @MODELS.register_module()
 class PPYOLOEHeadModule(BaseModule):
-    """PPYOLOEHead head module used in `PPYOLOE.
-
-    <https://arxiv.org/abs/2203.16250>`_.
-
-    Args:
-        num_classes (int): Number of categories excluding the background
-            category.
-        in_channels (int): Number of channels in the input feature map.
-        widen_factor (float): Width multiplier, multiply number of
-            channels in each layer by this amount. Defaults to 1.0.
-        num_base_priors (int): The number of priors (points) at a point
-            on the feature grid.
-        featmap_strides (Sequence[int]): Downsample factor of each feature map.
-             Defaults to (8, 16, 32).
-        reg_max (int): Max value of integral set :math: ``{0, ..., reg_max}``
-            in QFL setting. Defaults to 16.
-        norm_cfg (dict): Config dict for normalization layer.
-            Defaults to dict(type='BN', momentum=0.03, eps=0.001).
-        act_cfg (dict): Config dict for activation layer.
-            Defaults to dict(type='SiLU', inplace=True).
-        init_cfg (dict or list[dict], optional): Initialization config dict.
-            Defaults to None.
-    """
 
     def __init__(self,
                  num_classes: int,
+                 num_state: int,
                  in_channels: Union[int, Sequence],
                  widen_factor: float = 1.0,
                  num_base_priors: int = 1,
@@ -58,6 +37,7 @@ class PPYOLOEHeadModule(BaseModule):
         super().__init__(init_cfg=init_cfg)
 
         self.num_classes = num_classes
+        self.num_state = num_state
         self.featmap_strides = featmap_strides
         self.num_levels = len(self.featmap_strides)
         self.num_base_priors = num_base_priors
@@ -79,7 +59,9 @@ class PPYOLOEHeadModule(BaseModule):
         for conv in self.cls_preds:
             conv.bias.data.fill_(bias_init_with_prob(prior_prob))
             conv.weight.data.fill_(0.)
-
+        for conv in self.state_preds:
+            conv.bias.data.fill_(bias_init_with_prob(prior_prob))
+            conv.weight.data.fill_(0.)
         for conv in self.reg_preds:
             conv.bias.data.fill_(1.0)
             conv.weight.data.fill_(0.)
@@ -87,12 +69,18 @@ class PPYOLOEHeadModule(BaseModule):
     def _init_layers(self):
         """initialize conv layers in PPYOLOE head."""
         self.cls_preds = nn.ModuleList()
+        self.state_preds = nn.ModuleList()
         self.reg_preds = nn.ModuleList()
+
         self.cls_stems = nn.ModuleList()
+        self.state_stems = nn.ModuleList()
         self.reg_stems = nn.ModuleList()
 
         for in_channel in self.in_channels:
             self.cls_stems.append(
+                PPYOLOESELayer(
+                    in_channel, norm_cfg=self.norm_cfg, act_cfg=self.act_cfg))
+            self.state_stems.append(
                 PPYOLOESELayer(
                     in_channel, norm_cfg=self.norm_cfg, act_cfg=self.act_cfg))
             self.reg_stems.append(
@@ -102,6 +90,8 @@ class PPYOLOEHeadModule(BaseModule):
         for in_channel in self.in_channels:
             self.cls_preds.append(
                 nn.Conv2d(in_channel, self.num_classes, 3, padding=1))
+            self.state_preds.append(
+                nn.Conv2d(in_channel, self.num_state, 3, padding=1))
             self.reg_preds.append(
                 nn.Conv2d(in_channel, 4 * (self.reg_max + 1), 3, padding=1))
 
@@ -121,16 +111,20 @@ class PPYOLOEHeadModule(BaseModule):
         """
         assert len(x) == self.num_levels
 
-        return multi_apply(self.forward_single, x, self.cls_stems,
-                           self.cls_preds, self.reg_stems, self.reg_preds)
+        return multi_apply(self.forward_single, x, self.cls_stems, self.cls_preds,
+                           self.state_stems, self.state_preds, self.reg_stems, self.reg_preds)
 
     def forward_single(self, x: Tensor, cls_stem: nn.ModuleList,
-                       cls_pred: nn.ModuleList, reg_stem: nn.ModuleList,
+                       cls_pred: nn.ModuleList,
+                       state_stem: nn.ModuleList,
+                       state_pred: nn.ModuleList,
+                       reg_stem: nn.ModuleList,
                        reg_pred: nn.ModuleList) -> Tensor:
         """Forward feature of a single scale level."""
         b, _, h, w = x.shape
         avg_feat = F.adaptive_avg_pool2d(x, (1, 1))
         cls_logit = cls_pred(cls_stem(x, avg_feat) + x)
+        state_logit = state_pred(state_stem(x, avg_feat) + x)
         bbox_dist_preds = reg_pred(reg_stem(x, avg_feat))
         if self.reg_max > 1:
             bbox_dist_preds = bbox_dist_preds.reshape(
@@ -141,34 +135,13 @@ class PPYOLOEHeadModule(BaseModule):
         else:
             bbox_preds = bbox_dist_preds
         if self.training:
-            return cls_logit, bbox_preds, bbox_dist_preds
+            return cls_logit, state_logit, bbox_preds, bbox_dist_preds
         else:
-            return cls_logit, bbox_preds
+            return cls_logit, state_logit, bbox_preds
 
 
 @MODELS.register_module()
 class PPYOLOEHead(YOLOv6Head):
-    """PPYOLOEHead head used in `PPYOLOE <https://arxiv.org/abs/2203.16250>`_.
-    The YOLOv6 head and the PPYOLOE head are only slightly different.
-    Distribution focal loss is extra used in PPYOLOE, but not in YOLOv6.
-
-    Args:
-        head_module(ConfigType): Base module used for YOLOv5Head
-        prior_generator(dict): Points generator feature maps in
-            2D points-based detectors.
-        bbox_coder (:obj:`ConfigDict` or dict): Config of bbox coder.
-        loss_cls (:obj:`ConfigDict` or dict): Config of classification loss.
-        loss_bbox (:obj:`ConfigDict` or dict): Config of localization loss.
-        loss_dfl (:obj:`ConfigDict` or dict): Config of distribution focal
-            loss.
-        train_cfg (:obj:`ConfigDict` or dict, optional): Training config of
-            anchor head. Defaults to None.
-        test_cfg (:obj:`ConfigDict` or dict, optional): Testing config of
-            anchor head. Defaults to None.
-        init_cfg (:obj:`ConfigDict` or list[:obj:`ConfigDict`] or dict or
-            list[dict], optional): Initialization config dict.
-            Defaults to None.
-    """
 
     def __init__(self,
                  head_module: ConfigType,
@@ -178,6 +151,14 @@ class PPYOLOEHead(YOLOv6Head):
                      strides=[8, 16, 32]),
                  bbox_coder: ConfigType = dict(type='DistancePointBBoxCoder'),
                  loss_cls: ConfigType = dict(
+                     type='mmdet.VarifocalLoss',
+                     use_sigmoid=True,
+                     alpha=0.75,
+                     gamma=2.0,
+                     iou_weighted=True,
+                     reduction='sum',
+                     loss_weight=1.0),
+                 loss_state: ConfigType = dict(
                      type='mmdet.VarifocalLoss',
                      use_sigmoid=True,
                      alpha=0.75,
@@ -204,10 +185,12 @@ class PPYOLOEHead(YOLOv6Head):
             prior_generator=prior_generator,
             bbox_coder=bbox_coder,
             loss_cls=loss_cls,
+            loss_state=loss_state,
             loss_bbox=loss_bbox,
             train_cfg=train_cfg,
             test_cfg=test_cfg,
             init_cfg=init_cfg)
+        self.num_state = self.head_module.num_state
         self.loss_dfl = MODELS.build(loss_dfl)
         # ppyoloe doesn't need loss_obj
         self.loss_obj = None
@@ -215,6 +198,7 @@ class PPYOLOEHead(YOLOv6Head):
     def loss_by_feat(
             self,
             cls_scores: Sequence[Tensor],
+            state_scores: Sequence[Tensor],
             bbox_preds: Sequence[Tensor],
             bbox_dist_preds: Sequence[Tensor],
             batch_gt_instances: Sequence[InstanceData],
@@ -275,11 +259,38 @@ class PPYOLOEHead(YOLOv6Head):
         gt_bboxes = gt_info[:, :, 1:]  # xyxy
         pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # cls_label_temp = []
+        # state_label_temp = []
+        # for label in gt_labels:
+        #     cls_list = torch.tensor([], device=device)
+        #     cls_list = cls_list.view(1, -1, 1)
+        #     state_list = torch.tensor([], device=device)
+        #     state_list = state_list.view(1, -1, 1)
+        #     for l in label:
+        #         temp = l % 10  # 取余，得到个位
+        #         temp = temp.view(1, -1, 1)
+        #         cls_list = torch.cat((cls_list, temp), dim=1)
+        #         temp = torch.floor_divide(l, 10)  # 整除，取十位
+        #         temp = temp.view(1, -1, 1)
+        #         state_list = torch.cat((state_list, temp), dim=1)
+        #     cls_label_temp.append(cls_list)
+        #     state_label_temp.append(state_list)
+        #
+        # cls_label = torch.concat(cls_label_temp)
+        # state_label = torch.concat(state_label_temp)
+        cls_label = torch.remainder(gt_labels,10)
+        state_label = torch.floor_divide(gt_labels,10)
         # pred info
         flatten_cls_preds = [
             cls_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
                                                  self.num_classes)
             for cls_pred in cls_scores
+        ]
+        flatten_state_preds = [
+            state_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                   self.num_state)
+            for state_pred in state_scores
         ]
         flatten_pred_bboxes = [
             bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
@@ -294,40 +305,57 @@ class PPYOLOEHead(YOLOv6Head):
 
         flatten_dist_preds = torch.cat(flatten_pred_dists, dim=1)
         flatten_cls_preds = torch.cat(flatten_cls_preds, dim=1)
+        flatten_state_preds = torch.cat(flatten_state_preds, dim=1)
         flatten_pred_bboxes = torch.cat(flatten_pred_bboxes, dim=1)
         flatten_pred_bboxes = self.bbox_coder.decode(
             self.flatten_priors_train[..., :2], flatten_pred_bboxes,
             self.stride_tensor[..., 0])
-        pred_scores = torch.sigmoid(flatten_cls_preds)
+        cls_pred_scores = torch.sigmoid(flatten_cls_preds)
+        state_pred_scores = torch.sigmoid(flatten_state_preds)
 
         if current_epoch < self.initial_epoch:
-            assigned_result = self.initial_assigner(
+            cls_assigned_result = self.initial_assigner(
                 flatten_pred_bboxes.detach(), self.flatten_priors_train,
-                self.num_level_priors, gt_labels, gt_bboxes, pad_bbox_flag)
+                self.num_level_priors, cls_label, gt_bboxes, pad_bbox_flag,new_class=self.num_classes)
+            state_assigned_result = self.initial_assigner(
+                flatten_pred_bboxes.detach(), self.flatten_priors_train,
+                self.num_level_priors, state_label, gt_bboxes, pad_bbox_flag,new_class=self.num_state)
+            # print("-----------------------------initial_assigner--------------------------------------")
         else:
-            assigned_result = self.assigner(flatten_pred_bboxes.detach(),
-                                            pred_scores.detach(),
+            cls_assigned_result = self.assigner(flatten_pred_bboxes.detach(),
+                                            cls_pred_scores.detach(),
                                             self.flatten_priors_train,
-                                            gt_labels, gt_bboxes,
-                                            pad_bbox_flag)
+                                            cls_label, gt_bboxes,
+                                            pad_bbox_flag,new_value=self.num_classes)
+            state_assigned_result = self.assigner(flatten_pred_bboxes.detach(),
+                                            state_pred_scores.detach(),
+                                            self.flatten_priors_train,
+                                            state_label, gt_bboxes,
+                                            pad_bbox_flag,new_value=self.num_state)
+            # print("-----------------------------assigner--------------------------------------")
 
-        assigned_bboxes = assigned_result['assigned_bboxes']
-        assigned_scores = assigned_result['assigned_scores']
-        fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
-
+        assigned_bboxes = cls_assigned_result['assigned_bboxes']
+        cls_assigned_scores = cls_assigned_result['assigned_scores']
+        state_assigned_scores = state_assigned_result['assigned_scores']
+        fg_mask_pre_prior = cls_assigned_result['fg_mask_pre_prior']
         # cls loss
         with torch.cuda.amp.autocast(enabled=False):
-            loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores)
+            loss_cls = self.loss_cls(flatten_cls_preds, cls_assigned_scores)
+            loss_state = self.loss_state(flatten_state_preds, state_assigned_scores)
 
         # rescale bbox
         assigned_bboxes /= self.stride_tensor
         flatten_pred_bboxes /= self.stride_tensor
 
-        assigned_scores_sum = assigned_scores.sum()
+        cls_assigned_scores_sum = cls_assigned_scores.sum()
+        state_assigned_scores_sum = state_assigned_scores.sum()
         # reduce_mean between all gpus
-        assigned_scores_sum = torch.clamp(
-            reduce_mean(assigned_scores_sum), min=1)
-        loss_cls /= assigned_scores_sum
+        cls_assigned_scores_sum = torch.clamp(
+            reduce_mean(cls_assigned_scores_sum), min=1)
+        state_assigned_scores_sum = torch.clamp(
+            reduce_mean(state_assigned_scores_sum), min=1)
+        loss_cls /= cls_assigned_scores_sum
+        loss_state /= state_assigned_scores_sum
 
         # select positive samples mask
         num_pos = fg_mask_pre_prior.sum()
@@ -341,12 +369,12 @@ class PPYOLOEHead(YOLOv6Head):
             assigned_bboxes_pos = torch.masked_select(
                 assigned_bboxes, prior_bbox_mask).reshape([-1, 4])
             bbox_weight = torch.masked_select(
-                assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
+                cls_assigned_scores.sum(-1), fg_mask_pre_prior).unsqueeze(-1)
             loss_bbox = self.loss_bbox(
                 pred_bboxes_pos,
                 assigned_bboxes_pos,
                 weight=bbox_weight,
-                avg_factor=assigned_scores_sum)
+                avg_factor=cls_assigned_scores_sum)
 
             # dfl loss
             dist_mask = fg_mask_pre_prior.unsqueeze(-1).repeat(
@@ -366,9 +394,13 @@ class PPYOLOEHead(YOLOv6Head):
                 pred_dist_pos.reshape(-1, self.head_module.reg_max + 1),
                 assigned_ltrb_pos.reshape(-1),
                 weight=bbox_weight.expand(-1, 4).reshape(-1),
-                avg_factor=assigned_scores_sum)
+                avg_factor=cls_assigned_scores_sum)
         else:
             loss_bbox = flatten_pred_bboxes.sum() * 0
             loss_dfl = flatten_pred_bboxes.sum() * 0
 
-        return dict(loss_cls=loss_cls, loss_bbox=loss_bbox, loss_dfl=loss_dfl)
+        return dict(
+            loss_cls=loss_cls,
+            loss_state=loss_state,
+            loss_bbox=loss_bbox,
+            loss_dfl=loss_dfl)

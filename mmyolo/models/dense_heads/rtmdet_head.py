@@ -52,6 +52,7 @@ class RTMDetSepBNHeadModule(BaseModule):
     def __init__(
         self,
         num_classes: int,
+        num_state: int,
         in_channels: int,
         widen_factor: float = 1.0,
         num_base_priors: int = 1,
@@ -68,6 +69,7 @@ class RTMDetSepBNHeadModule(BaseModule):
         super().__init__(init_cfg=init_cfg)
         self.share_conv = share_conv
         self.num_classes = num_classes
+        self.num_state = num_state
         self.pred_kernel_size = pred_kernel_size
         self.feat_channels = int(feat_channels * widen_factor)
         self.stacked_convs = stacked_convs
@@ -85,16 +87,29 @@ class RTMDetSepBNHeadModule(BaseModule):
     def _init_layers(self):
         """Initialize layers of the head."""
         self.cls_convs = nn.ModuleList()
+        self.state_convs = nn.ModuleList()
         self.reg_convs = nn.ModuleList()
 
         self.rtm_cls = nn.ModuleList()
+        self.rtm_state = nn.ModuleList()
         self.rtm_reg = nn.ModuleList()
         for n in range(len(self.featmap_strides)):
             cls_convs = nn.ModuleList()
+            state_convs = nn.ModuleList()
             reg_convs = nn.ModuleList()
             for i in range(self.stacked_convs):
                 chn = self.in_channels if i == 0 else self.feat_channels
                 cls_convs.append(
+                    ConvModule(
+                        chn,
+                        self.feat_channels,
+                        3,
+                        stride=1,
+                        padding=1,
+                        conv_cfg=self.conv_cfg,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg))
+                state_convs.append(
                     ConvModule(
                         chn,
                         self.feat_channels,
@@ -115,12 +130,19 @@ class RTMDetSepBNHeadModule(BaseModule):
                         norm_cfg=self.norm_cfg,
                         act_cfg=self.act_cfg))
             self.cls_convs.append(cls_convs)
+            self.state_convs.append(state_convs)
             self.reg_convs.append(reg_convs)
 
             self.rtm_cls.append(
                 nn.Conv2d(
                     self.feat_channels,
                     self.num_base_priors * self.num_classes,
+                    self.pred_kernel_size,
+                    padding=self.pred_kernel_size // 2))
+            self.rtm_state.append(
+                nn.Conv2d(
+                    self.feat_channels,
+                    self.num_base_priors * self.num_state,
                     self.pred_kernel_size,
                     padding=self.pred_kernel_size // 2))
             self.rtm_reg.append(
@@ -134,6 +156,7 @@ class RTMDetSepBNHeadModule(BaseModule):
             for n in range(len(self.featmap_strides)):
                 for i in range(self.stacked_convs):
                     self.cls_convs[n][i].conv = self.cls_convs[0][i].conv
+                    self.state_convs[n][i].conv = self.state_convs[0][i].conv
                     self.reg_convs[n][i].conv = self.reg_convs[0][i].conv
 
     def init_weights(self) -> None:
@@ -146,8 +169,10 @@ class RTMDetSepBNHeadModule(BaseModule):
             if is_norm(m):
                 constant_init(m, 1)
         bias_cls = bias_init_with_prob(0.01)
-        for rtm_cls, rtm_reg in zip(self.rtm_cls, self.rtm_reg):
+        bias_state = bias_init_with_prob(0.01)
+        for rtm_cls, rtm_state, rtm_reg in zip(self.rtm_cls, self.rtm_state, self.rtm_reg):
             normal_init(rtm_cls, std=0.01, bias=bias_cls)
+            normal_init(rtm_state, std=0.01, bias=bias_state)
             normal_init(rtm_reg, std=0.01)
 
     def forward(self, feats: Tuple[Tensor, ...]) -> tuple:
@@ -168,22 +193,29 @@ class RTMDetSepBNHeadModule(BaseModule):
         """
 
         cls_scores = []
+        state_scores = []
         bbox_preds = []
         for idx, x in enumerate(feats):
             cls_feat = x
+            state_feat = x
             reg_feat = x
 
             for cls_layer in self.cls_convs[idx]:
                 cls_feat = cls_layer(cls_feat)
             cls_score = self.rtm_cls[idx](cls_feat)
 
+            for state_layer in self.state_convs[idx]:
+                state_feat = state_layer(state_feat)
+            state_score = self.rtm_state[idx](state_feat)
+
             for reg_layer in self.reg_convs[idx]:
                 reg_feat = reg_layer(reg_feat)
 
             reg_dist = self.rtm_reg[idx](reg_feat)
             cls_scores.append(cls_score)
+            state_scores.append(state_score)
             bbox_preds.append(reg_dist)
-        return tuple(cls_scores), tuple(bbox_preds)
+        return tuple(cls_scores), tuple(state_scores), tuple(bbox_preds)
 
 
 @MODELS.register_module()
@@ -218,6 +250,11 @@ class RTMDetHead(YOLOv5Head):
                      use_sigmoid=True,
                      beta=2.0,
                      loss_weight=1.0),
+                 loss_state: ConfigType = dict(
+                     type='mmdet.QualityFocalLoss',
+                     use_sigmoid=True,
+                     beta=2.0,
+                     loss_weight=1.0),
                  loss_bbox: ConfigType = dict(
                      type='mmdet.GIoULoss', loss_weight=2.0),
                  train_cfg: OptConfigType = None,
@@ -229,16 +266,23 @@ class RTMDetHead(YOLOv5Head):
             prior_generator=prior_generator,
             bbox_coder=bbox_coder,
             loss_cls=loss_cls,
+            loss_state=loss_state,
             loss_bbox=loss_bbox,
             train_cfg=train_cfg,
             test_cfg=test_cfg,
             init_cfg=init_cfg)
 
         self.use_sigmoid_cls = loss_cls.get('use_sigmoid', False)
+        self.use_sigmoid_state = loss_state.get('use_sigmoid', False)
         if self.use_sigmoid_cls:
             self.cls_out_channels = self.num_classes
         else:
             self.cls_out_channels = self.num_classes + 1
+
+        if self.use_sigmoid_state:
+            self.state_out_channels = self.num_state
+        else:
+            self.state_out_channels = self.num_state + 1
         # rtmdet doesn't need loss_obj
         self.loss_obj = None
 
@@ -274,6 +318,7 @@ class RTMDetHead(YOLOv5Head):
     def loss_by_feat(
             self,
             cls_scores: List[Tensor],
+            state_scores: List[Tensor],
             bbox_preds: List[Tensor],
             batch_gt_instances: InstanceList,
             batch_img_metas: List[dict],
@@ -318,10 +363,39 @@ class RTMDetHead(YOLOv5Head):
             self.flatten_priors_train = torch.cat(
                 mlvl_priors_with_stride, dim=0)
 
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls_label = torch.tensor([], device=device)
+        state_label = torch.tensor([], device=device)
+        cls_label_temp = []
+        state_label_temp = []
+        for label in gt_labels:
+            cls_list = torch.tensor([], device=device)
+            cls_list = cls_list.view(1, -1, 1)
+            state_list = torch.tensor([], device=device)
+            state_list = state_list.view(1, -1, 1)
+            for l in label:
+                temp = l % 10  # 取余，得到个位
+                temp = temp.view(1, -1, 1)
+                cls_list = torch.cat((cls_list, temp), dim=1)
+                temp = torch.floor_divide(l, 10)  # 整除，取十位
+                temp = temp.view(1, -1, 1)
+                state_list = torch.cat((state_list, temp), dim=1)
+            cls_label_temp.append(cls_list)
+            state_label_temp.append(state_list)
+
+        cls_label = torch.concat(cls_label_temp)
+        state_label = torch.concat(state_label_temp)
+
         flatten_cls_scores = torch.cat([
             cls_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
                                                   self.cls_out_channels)
             for cls_score in cls_scores
+        ], 1).contiguous()
+
+        flatten_state_scores = torch.cat([
+            state_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                  self.state_out_channels)
+            for state_score in state_scores
         ], 1).contiguous()
 
         flatten_bboxes = torch.cat([
@@ -333,36 +407,64 @@ class RTMDetHead(YOLOv5Head):
         flatten_bboxes = distance2bbox(self.flatten_priors_train[..., :2],
                                        flatten_bboxes)
 
-        assigned_result = self.assigner(flatten_bboxes.detach(),
+        cls_assigned_result = self.assigner(flatten_bboxes.detach(),
                                         flatten_cls_scores.detach(),
-                                        self.flatten_priors_train, gt_labels,
-                                        gt_bboxes, pad_bbox_flag)
+                                        self.flatten_priors_train, cls_label,
+                                        gt_bboxes, pad_bbox_flag, self.num_classes)
 
-        labels = assigned_result['assigned_labels'].reshape(-1)
-        label_weights = assigned_result['assigned_labels_weights'].reshape(-1)
-        bbox_targets = assigned_result['assigned_bboxes'].reshape(-1, 4)
-        assign_metrics = assigned_result['assign_metrics'].reshape(-1)
+        cls_labels = cls_assigned_result['assigned_labels'].reshape(-1)
+        cls_label_weights = cls_assigned_result['assigned_labels_weights'].reshape(-1)
+        bbox_targets = cls_assigned_result['assigned_bboxes'].reshape(-1, 4)
+        cls_assign_metrics = cls_assigned_result['assign_metrics'].reshape(-1)
+
+        state_assigned_result = self.assigner(flatten_bboxes.detach(),
+                                            flatten_state_scores.detach(),
+                                            self.flatten_priors_train, state_label,
+                                            gt_bboxes, pad_bbox_flag, self.num_state)
+
+        state_labels = state_assigned_result['assigned_labels'].reshape(-1)
+        state_label_weights = state_assigned_result['assigned_labels_weights'].reshape(-1)
+        state_assign_metrics = state_assigned_result['assign_metrics'].reshape(-1)
+
         cls_preds = flatten_cls_scores.reshape(-1, self.num_classes)
+        state_preds = flatten_state_scores.reshape(-1, self.num_state)
         bbox_preds = flatten_bboxes.reshape(-1, 4)
 
         # FG cat_id: [0, num_classes -1], BG cat_id: num_classes
         bg_class_ind = self.num_classes
-        pos_inds = ((labels >= 0)
-                    & (labels < bg_class_ind)).nonzero().squeeze(1)
-        avg_factor = reduce_mean(assign_metrics.sum()).clamp_(min=1).item()
+        bg_state_ind = self.num_state
+        cls_pos_inds = ((cls_labels >= 0)
+                    & (cls_labels < bg_class_ind)).nonzero().squeeze(1)
+        cls_avg_factor = reduce_mean(cls_assign_metrics.sum()).clamp_(min=1).item()
+        state_pos_inds = ((state_labels >= 0)
+                    & (state_labels < bg_state_ind)).nonzero().squeeze(1)
+        state_avg_factor = reduce_mean(state_assign_metrics.sum()).clamp_(min=1).item()
 
         loss_cls = self.loss_cls(
-            cls_preds, (labels, assign_metrics),
-            label_weights,
-            avg_factor=avg_factor)
+            cls_preds, (cls_labels, cls_assign_metrics),
+            cls_label_weights,
+            avg_factor=cls_avg_factor)
 
-        if len(pos_inds) > 0:
+        loss_state = self.loss_state(
+            state_preds, (state_labels, state_assign_metrics),
+            state_label_weights,
+            avg_factor=state_avg_factor)
+
+############################ 这里不懂 ####################################################
+        if len(cls_pos_inds) > 0:
             loss_bbox = self.loss_bbox(
-                bbox_preds[pos_inds],
-                bbox_targets[pos_inds],
-                weight=assign_metrics[pos_inds],
-                avg_factor=avg_factor)
+                bbox_preds[cls_pos_inds],
+                bbox_targets[cls_pos_inds],
+                weight=cls_assign_metrics[cls_pos_inds],
+                avg_factor=cls_avg_factor)
+        # if len(pos_inds) > 0:
+        #     loss_bbox = self.loss_bbox(
+        #         bbox_preds[pos_inds],
+        #         bbox_targets[pos_inds],
+        #         weight=assign_metrics[pos_inds],
+        #         avg_factor=avg_factor)
         else:
             loss_bbox = bbox_preds.sum() * 0
 
-        return dict(loss_cls=loss_cls, loss_bbox=loss_bbox)
+        return dict(loss_cls=loss_cls, loss_state=loss_state, loss_bbox=loss_bbox)
+

@@ -3,14 +3,138 @@ _base_ = ['../_base_/default_runtime.py', '../_base_/det_p5_tta.py']
 # dataset settings
 data_root = 'data/coco/'
 dataset_type = 'YOLOv5CocoDataset'
-
+metainfo = dict(
+    classes=(
+        'bowlor',
+        'appleor',
+        'mouseor',
+        'keyboardor',
+        'bananaor',
+        'carrotor',
+        'cupor',
+        'orangeor',
+        'chairor',
+        'bookor',
+        'bowlmi',
+        'applemi',
+        'mousemi',
+        'keyboardmi',
+        'bananami',
+        'carrotmi',
+        'cupmi',
+        'orangemi',
+        'chairmi',
+        'bookmi',
+    ),
+    palette=[
+        (
+            0,
+            47,
+            167,
+        ),
+        (
+            129,
+            216,
+            207,
+        ),
+        (
+            0,
+            49,
+            82,
+        ),
+        (
+            176,
+            89,
+            35,
+        ),
+        (
+            230,
+            0,
+            0,
+        ),
+        (
+            144,
+            0,
+            33,
+        ),
+        (
+            251,
+            210,
+            106,
+        ),
+        (
+            143,
+            75,
+            40,
+        ),
+        (
+            1,
+            132,
+            127,
+        ),
+        (
+            64,
+            224,
+            208,
+        ),
+        (
+            0,
+            47,
+            167,
+        ),
+        (
+            129,
+            216,
+            207,
+        ),
+        (
+            0,
+            49,
+            82,
+        ),
+        (
+            176,
+            89,
+            35,
+        ),
+        (
+            230,
+            0,
+            0,
+        ),
+        (
+            144,
+            0,
+            33,
+        ),
+        (
+            251,
+            210,
+            106,
+        ),
+        (
+            143,
+            75,
+            40,
+        ),
+        (
+            1,
+            132,
+            127,
+        ),
+        (
+            64,
+            224,
+            208,
+        ),
+    ])
 # parameters that often need to be modified
 img_scale = (640, 640)  # width, height
 deepen_factor = 0.33
 widen_factor = 0.5
-max_epochs = 80
-num_classes = 80
-save_epoch_intervals = 5
+max_epochs = 12
+num_classes = 20
+save_epoch_intervals = 300
 train_batch_size_per_gpu = 8
 train_num_workers = 8
 val_batch_size_per_gpu = 1
@@ -18,7 +142,7 @@ val_num_workers = 2
 
 # The pretrained model is geted and converted from official PPYOLOE.
 # https://github.com/PaddlePaddle/PaddleDetection/blob/release/2.5/configs/ppyoloe/README.md
-load_from = 'https://download.openmmlab.com/mmyolo/v0/ppyoloe/ppyoloe_pretrain/ppyoloe_plus_s_obj365_pretrained-bcfe8478.pth'  # noqa
+load_from = '.\\checkpoints\\ppyoloe_plus_s_obj365_pretrained-bcfe8478.pth'  # noqa
 
 # persistent_workers must be False if num_workers is 0.
 persistent_workers = True
@@ -38,7 +162,7 @@ model = dict(
             dict(
                 type='PPYOLOEBatchRandomResize',
                 random_size_range=(320, 800),
-                interval=1,
+                interval=300,
                 size_divisor=32,
                 random_interp=True,
                 keep_ratio=False)
@@ -151,8 +275,9 @@ train_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
+        metainfo = metainfo,
         ann_file='annotations/instances_train2017.json',
-        data_prefix=dict(img='train2017/'),
+        data_prefix=dict(img='images/'),
         filter_cfg=dict(filter_empty_gt=True, min_size=0),
         pipeline=train_pipeline))
 
@@ -181,8 +306,9 @@ val_dataloader = dict(
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
+        metainfo=metainfo,
         test_mode=True,
-        data_prefix=dict(img='val2017/'),
+        data_prefix=dict(img='images/'),
         filter_cfg=dict(filter_empty_gt=True, min_size=0),
         ann_file='annotations/instances_val2017.json',
         pipeline=test_pipeline))
@@ -205,7 +331,7 @@ default_hooks = dict(
         type='PPYOLOEParamSchedulerHook',
         warmup_min_iter=1000,
         start_factor=0.,
-        warmup_epochs=5,
+        warmup_epochs=2,
         min_lr_ratio=0.0,
         total_epochs=int(max_epochs * 1.2)),
     checkpoint=dict(

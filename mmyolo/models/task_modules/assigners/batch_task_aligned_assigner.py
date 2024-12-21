@@ -54,13 +54,15 @@ class BatchTaskAlignedAssigner(nn.Module):
 
     @torch.no_grad()
     def forward(
-        self,
-        pred_bboxes: Tensor,
-        pred_scores: Tensor,
-        priors: Tensor,
-        gt_labels: Tensor,
-        gt_bboxes: Tensor,
-        pad_bbox_flag: Tensor,
+            self,
+            pred_bboxes: Tensor,
+            pred_scores: Tensor,
+            priors: Tensor,
+            gt_labels: Tensor,
+            gt_bboxes: Tensor,
+            pad_bbox_flag: Tensor,
+            num_class,
+            new_pos_mask: Tensor
     ) -> dict:
         """Assign gt to bboxes.
 
@@ -94,6 +96,8 @@ class BatchTaskAlignedAssigner(nn.Module):
                 fg_mask_pre_prior (Tensor): Force ground truth matching mask,
                     shape(batch_size, num_priors)
         """
+
+        self.num_classes = num_class
         # (num_priors, 4) -> (num_priors, 2)
         priors = priors[:, :2]
 
@@ -102,22 +106,30 @@ class BatchTaskAlignedAssigner(nn.Module):
 
         assigned_result = {
             'assigned_labels':
-            gt_bboxes.new_full(pred_scores[..., 0].shape, self.num_classes),
+                gt_bboxes.new_full(pred_scores[..., 0].shape, self.num_classes),
             'assigned_bboxes':
-            gt_bboxes.new_full(pred_bboxes.shape, 0),
+                gt_bboxes.new_full(pred_bboxes.shape, 0),
             'assigned_scores':
-            gt_bboxes.new_full(pred_scores.shape, 0),
+                gt_bboxes.new_full(pred_scores.shape, 0),
             'fg_mask_pre_prior':
-            gt_bboxes.new_full(pred_scores[..., 0].shape, 0)
+                gt_bboxes.new_full(pred_scores[..., 0].shape, 0)
         }
 
         if num_gt == 0:
             return assigned_result
 
+        # pos_mask [bs,num_gts,num_priors] 用于指示每个 GT 包含内 alignment_metrics 得分前十的 prior 位置在哪
         pos_mask, alignment_metrics, overlaps = self.get_pos_mask(
             pred_bboxes, pred_scores, priors, gt_labels, gt_bboxes,
             pad_bbox_flag, batch_size, num_gt)
 
+        if new_pos_mask is not None:
+            pos_mask = new_pos_mask
+
+        # 若某个 prior 的位置被多个 GT 覆盖，只会在 IOU 最大的那个 GT 上为 1， 其他 GT 上为 0
+        # assigned_gt_idxs [bs,num_priors] 保存每个是正样本位置上 gt id 信息，指示该位置是属于哪个 GT 的样本
+        # pos_mask [bs,num_gt,num_prior] 指示哪个是正样本区域
+        # fg_mask_pre_prior [bs,num_priors] 保存哪个位置上是正样本，1 表示是正样本，0则不是
         (assigned_gt_idxs, fg_mask_pre_prior,
          pos_mask) = select_highest_overlaps(pos_mask, overlaps, num_gt)
 
@@ -128,17 +140,20 @@ class BatchTaskAlignedAssigner(nn.Module):
 
         # normalize
         alignment_metrics *= pos_mask
+        # 保存每个 gt 最大的 alignment_metrics 分数
         pos_align_metrics = alignment_metrics.max(axis=-1, keepdim=True)[0]
+        # 保存每个 gt 的匹配的最大 iou 值
         pos_overlaps = (overlaps * pos_mask).max(axis=-1, keepdim=True)[0]
         norm_align_metric = (
-            alignment_metrics * pos_overlaps /
-            (pos_align_metrics + self.eps)).max(-2)[0].unsqueeze(-1)
+                alignment_metrics * pos_overlaps /
+                (pos_align_metrics + self.eps)).max(-2)[0].unsqueeze(-1)
         assigned_scores = assigned_scores * norm_align_metric
 
         assigned_result['assigned_labels'] = assigned_labels
         assigned_result['assigned_bboxes'] = assigned_bboxes
         assigned_result['assigned_scores'] = assigned_scores
         assigned_result['fg_mask_pre_prior'] = fg_mask_pre_prior.bool()
+        # assigned_result['pos_mask'] = pos_mask
         return assigned_result
 
     def get_pos_mask(self, pred_bboxes: Tensor, pred_scores: Tensor,
@@ -292,11 +307,14 @@ class BatchTaskAlignedAssigner(nn.Module):
         # assigned target labels
         batch_ind = torch.arange(
             end=batch_size, dtype=torch.int64, device=gt_labels.device)[...,
-                                                                        None]
+        None]
+        # 在每张图片上增加偏移，方便进行批量操作
         assigned_gt_idxs = assigned_gt_idxs + batch_ind * num_gt
+        # 为每个位置分配对应的 gt_label
         assigned_labels = gt_labels.long().flatten()[assigned_gt_idxs]
 
         # assigned target boxes
+        # 为每个位置分配对应的 gt_bbox
         assigned_bboxes = gt_bboxes.reshape([-1, 4])[assigned_gt_idxs]
 
         # assigned target scores

@@ -73,7 +73,7 @@ class BatchATSSAssigner(nn.Module):
     @torch.no_grad()
     def forward(self, pred_bboxes: Tensor, priors: Tensor,
                 num_level_priors: List, gt_labels: Tensor, gt_bboxes: Tensor,
-                pad_bbox_flag: Tensor) -> dict:
+                pad_bbox_flag: Tensor,new_class) -> dict:
         """Assign gt to priors.
 
         The assignment is done in following steps
@@ -109,6 +109,7 @@ class BatchATSSAssigner(nn.Module):
                     shape(batch_size, num_gt, number_classes)
                 'fg_mask_pre_prior' (Tensor): shape(bs, num_gt)
         """
+        self.num_classes = new_class
         # generate priors
         cell_half_size = priors[:, 2:] * 2.5
         priors_gen = torch.zeros_like(priors)

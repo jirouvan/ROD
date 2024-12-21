@@ -47,6 +47,7 @@ class YOLOv6HeadModule(BaseModule):
 
     def __init__(self,
                  num_classes: int,
+                 num_state: int,
                  in_channels: Union[int, Sequence],
                  widen_factor: float = 1.0,
                  num_base_priors: int = 1,
@@ -59,6 +60,7 @@ class YOLOv6HeadModule(BaseModule):
         super().__init__(init_cfg=init_cfg)
 
         self.num_classes = num_classes
+        self.num_state = num_state
         self.featmap_strides = featmap_strides
         self.num_levels = len(self.featmap_strides)
         self.num_base_priors = num_base_priors
@@ -220,6 +222,14 @@ class YOLOv6Head(YOLOv5Head):
                      iou_weighted=True,
                      reduction='sum',
                      loss_weight=1.0),
+                 loss_state: ConfigType = dict(
+                     type='mmdet.VarifocalLoss',
+                     use_sigmoid=True,
+                     alpha=0.75,
+                     gamma=2.0,
+                     iou_weighted=True,
+                     reduction='sum',
+                     loss_weight=1.0),
                  loss_bbox: ConfigType = dict(
                      type='IoULoss',
                      iou_mode='giou',
@@ -235,6 +245,7 @@ class YOLOv6Head(YOLOv5Head):
             prior_generator=prior_generator,
             bbox_coder=bbox_coder,
             loss_cls=loss_cls,
+            loss_state=loss_state,
             loss_bbox=loss_bbox,
             train_cfg=train_cfg,
             test_cfg=test_cfg,

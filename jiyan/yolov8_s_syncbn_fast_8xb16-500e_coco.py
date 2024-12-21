@@ -59,7 +59,7 @@ albu_train_transforms = [
 backend_args = None
 base_lr = 0.0025
 batch_shapes_cfg = None
-close_mosaic_epochs = 2
+close_mosaic_epochs = 20
 custom_hooks = [
     dict(
         ema_type='ExpMomentumEMA',
@@ -69,7 +69,7 @@ custom_hooks = [
         type='EMAHook',
         update_buffers=True),
     dict(
-        switch_epoch=10,
+        switch_epoch=280,
         switch_pipeline=[
             dict(backend_args=None, type='LoadImageFromFile'),
             dict(type='LoadAnnotations', with_bbox=True),
@@ -135,16 +135,20 @@ dataset_type = 'YOLOv5CocoDataset'
 deepen_factor = 0.33
 default_hooks = dict(
     checkpoint=dict(
-        interval=1, max_keep_ckpts=3, save_best='auto', type='CheckpointHook'),
-    logger=dict(interval=5, type='LoggerHook'),
+        interval=20,
+        max_keep_ckpts=15,
+        save_best='auto',
+        type='CheckpointHook'),
+    logger=dict(interval=10, type='LoggerHook'),
     param_scheduler=dict(
         lr_factor=0.0025,
-        max_epochs=12,
+        max_epochs=300,
         scheduler_type='linear',
         type='YOLOv5ParamSchedulerHook'),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     timer=dict(type='IterTimerHook'),
-    visualization=dict(type='mmdet.DetVisualizationHook'))
+    visualization=dict(
+        draw=True, show=True, type='mmdet.DetVisualizationHook', wait_time=2))
 default_scope = 'mmyolo'
 env_cfg = dict(
     cudnn_benchmark=True,
@@ -205,11 +209,11 @@ log_level = 'INFO'
 log_processor = dict(by_epoch=True, type='LogProcessor', window_size=50)
 loss_bbox_weight = 7.5
 loss_cls_weight = 0.5
-# loss_sta_weight = 0.5
 loss_dfl_weight = 0.375
+loss_state_weight = 0.5
 lr_factor = 0.0025
 max_aspect_ratio = 100
-max_epochs = 12
+max_epochs = 300
 max_keep_ckpts = 2
 metainfo = dict(
     classes=(
@@ -360,8 +364,8 @@ model = dict(
                 1024,
             ],
             norm_cfg=dict(eps=0.001, momentum=0.03, type='BN'),
-            num_classes=20,
-            # num_state=2,
+            num_classes=10,
+            num_state=2,
             reg_max=16,
             type='YOLOv8HeadModule',
             widen_factor=0.5),
@@ -377,15 +381,15 @@ model = dict(
             reduction='none',
             type='mmdet.CrossEntropyLoss',
             use_sigmoid=True),
-        # loss_state=dict(
-        #     loss_weight=0.5,
-        #     reduction='none',
-        #     type='mmdet.CrossEntropyLoss',
-        #     use_sigmoid=True),
         loss_dfl=dict(
             loss_weight=0.375,
             reduction='mean',
             type='mmdet.DistributionFocalLoss'),
+        loss_state=dict(
+            loss_weight=0.5,
+            reduction='none',
+            type='mmdet.CrossEntropyLoss',
+            use_sigmoid=True),
         prior_generator=dict(
             offset=0.5, strides=[
                 8,
@@ -434,10 +438,9 @@ model = dict(
             alpha=0.5,
             beta=6.0,
             eps=1e-09,
-            num_classes=20,
-            # num_state=2,
+            num_classes=10,
             topk=10,
-            type='BatchTaskAlignedAssigner',
+            type='mi_BatchTaskAlignedAssigner',
             use_ciou=True)),
     type='YOLODetector')
 model_test_cfg = dict(
@@ -447,14 +450,14 @@ model_test_cfg = dict(
     nms_pre=30000,
     score_thr=0.001)
 norm_cfg = dict(eps=0.001, momentum=0.03, type='BN')
-num_classes = 20
-# num_state = 2
+num_classes = 10
 num_det_layers = 3
+num_state = 2
 optim_wrapper = dict(
     clip_grad=dict(max_norm=10.0),
     constructor='YOLOv5OptimizerConstructor',
     optimizer=dict(
-        batch_size_per_gpu=16,
+        batch_size_per_gpu=8,
         lr=0.0025,
         momentum=0.937,
         nesterov=True,
@@ -468,7 +471,7 @@ pre_transform = [
     dict(type='LoadAnnotations', with_bbox=True),
 ]
 resume = False
-save_epoch_intervals = 1
+save_epoch_intervals = 300
 strides = [
     8,
     16,
@@ -479,7 +482,7 @@ tal_beta = 6.0
 tal_topk = 10
 test_cfg = dict(type='TestLoop')
 test_dataloader = dict(
-    batch_size=1,
+    batch_size=8,
     dataset=dict(
         ann_file='annotations/instances_val2017.json',
         batch_shapes_cfg=None,
@@ -679,7 +682,7 @@ test_pipeline = [
         type='mmdet.PackDetInputs'),
 ]
 train_ann_file = 'annotations/instances_train2017.json'
-train_batch_size_per_gpu = 16
+train_batch_size_per_gpu = 8
 train_cfg = dict(
     dynamic_intervals=[
         (
@@ -687,12 +690,12 @@ train_cfg = dict(
             1,
         ),
     ],
-    max_epochs=12,
+    max_epochs=300,
     type='EpochBasedTrainLoop',
-    val_interval=1)
+    val_interval=300)
 train_data_prefix = 'images/'
 train_dataloader = dict(
-    batch_size=16,
+    batch_size=8,
     collate_fn=dict(type='yolov5_collate'),
     dataset=dict(
         ann_file='annotations/instances_train2017.json',
@@ -1092,11 +1095,11 @@ tta_pipeline = [
         type='TestTimeAug'),
 ]
 val_ann_file = 'annotations/instances_val2017.json'
-val_batch_size_per_gpu = 1
+val_batch_size_per_gpu = 8
 val_cfg = dict(type='ValLoop')
 val_data_prefix = 'images/'
 val_dataloader = dict(
-    batch_size=1,
+    batch_size=8,
     dataset=dict(
         ann_file='annotations/instances_val2017.json',
         batch_shapes_cfg=None,
@@ -1269,7 +1272,7 @@ val_evaluator = dict(
         10,
     ),
     type='mmdet.CocoMetric')
-val_interval_stage2 = 1
+val_interval_stage2 = 300
 val_num_workers = 2
 vis_backends = [
     dict(type='LocalVisBackend'),

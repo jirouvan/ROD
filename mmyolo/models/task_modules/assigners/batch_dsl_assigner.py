@@ -119,9 +119,16 @@ class BatchDynamicSoftLabelAssigner(nn.Module):
         self.batch_iou = batch_iou
 
     @torch.no_grad()
-    def forward(self, pred_bboxes: Tensor, pred_scores: Tensor, priors: Tensor,
-                gt_labels: Tensor, gt_bboxes: Tensor,
-                pad_bbox_flag: Tensor) -> dict:
+    def forward(self,
+                pred_bboxes: Tensor,
+                pred_scores: Tensor,
+                priors: Tensor,
+                gt_labels: Tensor,
+                gt_bboxes: Tensor,
+                pad_bbox_flag: Tensor,
+                new_value,
+                ) -> dict:
+        self.num_classes = new_value
         num_gt = gt_bboxes.size(1)
         decoded_bboxes = pred_bboxes
         batch_size, num_bboxes, box_dim = decoded_bboxes.size()
@@ -270,3 +277,4 @@ class BatchDynamicSoftLabelAssigner(nn.Module):
                              pairwise_ious).sum(2)[fg_mask_inboxes]
         matched_gt_inds = matching_matrix[fg_mask_inboxes, :].argmax(1)
         return matched_pred_ious, matched_gt_inds, fg_mask_inboxes
+
