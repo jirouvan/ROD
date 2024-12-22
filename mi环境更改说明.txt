@@ -1,0 +1,14 @@
+注意cal_map的136行
+D:\anaconda\envs\mi\Lib\site-packages\mmdet\models\detectors\single_stage.py的114行
+
+            if TensorA.numel() > 0:
+                flattened_A = TensorA.view(TensorA.shape[0], -1)
+                flattened_B = TensorB.view(TensorB.shape[0], -1)
+                expanded_A = flattened_A.unsqueeze(1).expand(-1, flattened_B.shape[0], -1)
+                matches = (expanded_A == flattened_B.unsqueeze(0))
+                matches_all = matches.all(dim=2)
+                found_indices = [torch.nonzero(matches_all[i]).squeeze().tolist() for i in range(matches_all.shape[0])]
+            else:
+                results_list_cls.append(results_cls)
+                results_list_state.append(results_state)
+                return results_list_cls, results_list_state
